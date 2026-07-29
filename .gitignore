@@ -1,0 +1,6 @@
+dist/
+installer-output/
+tools/
+innosetup-*.exe
+innosetup-install.log
+*.tmp
