@@ -32,7 +32,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code: $LASTEXITCODE"
 }
 
-Copy-Item -LiteralPath "$projectRoot\assets\lulu-typing.png" -Destination "$assetDir\lulu-typing.png" -Force
-Copy-Item -LiteralPath "$projectRoot\assets\lulu-typing-press.png" -Destination "$assetDir\lulu-typing-press.png" -Force
+$petFrames = @(
+    "lulu-work.png",
+    "lulu-work-typing.png",
+    "lulu-mouse-click.png",
+    "lulu-knock.png",
+    "lulu-knock-press.png"
+)
+
+foreach ($frame in $petFrames) {
+    Copy-Item -LiteralPath (Join-Path $projectRoot "assets\$frame") -Destination $assetDir -Force
+}
 Copy-Item -LiteralPath "$projectRoot\assets\lulu.ico" -Destination "$assetDir\lulu.ico" -Force
 Write-Host "Build complete: $outputDir\LuluDesktopPet.exe"

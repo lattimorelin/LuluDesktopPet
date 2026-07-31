@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -16,6 +17,7 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using Ellipse = System.Windows.Shapes.Ellipse;
 
 namespace LuluDesktopPet
 {
@@ -38,6 +40,54 @@ namespace LuluDesktopPet
         public StatsFile()
         {
             Days = new Dictionary<string, DayStats>();
+        }
+    }
+
+    public sealed class PetSettings
+    {
+        public double IdleMinutes { get; set; }
+
+        public PetSettings()
+        {
+            IdleMinutes = 5.0;
+        }
+    }
+
+    public sealed class SettingsStore
+    {
+        private readonly string filePath;
+        private readonly JavaScriptSerializer serializer = new JavaScriptSerializer();
+
+        public PetSettings Settings { get; private set; }
+
+        public SettingsStore()
+        {
+            string folder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "LuluDesktopPet");
+            Directory.CreateDirectory(folder);
+            filePath = Path.Combine(folder, "settings.json");
+            Settings = Load();
+        }
+
+        private PetSettings Load()
+        {
+            try
+            {
+                if (!File.Exists(filePath)) return new PetSettings();
+                PetSettings loaded = serializer.Deserialize<PetSettings>(
+                    File.ReadAllText(filePath, Encoding.UTF8));
+                return loaded ?? new PetSettings();
+            }
+            catch
+            {
+                return new PetSettings();
+            }
+        }
+
+        public void Save()
+        {
+            File.WriteAllText(filePath, serializer.Serialize(Settings), new UTF8Encoding(false));
         }
     }
 
@@ -284,6 +334,8 @@ namespace LuluDesktopPet
 
         public bool Paused { get; set; }
         public event Action KeyboardActivity;
+        public event Action MouseClickActivity;
+        public event Action AnyActivity;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct RAWINPUTDEVICE
@@ -380,16 +432,20 @@ namespace LuluDesktopPet
                     {
                         keysDown.Remove(physical);
                     }
-                    else if (keysDown.Add(physical) && !Paused)
+                    else if (keysDown.Add(physical))
                     {
-                        store.AddKeyboard(KeyNames.FromRaw(keyboard.VKey, keyboard.MakeCode, keyboard.Flags));
-                        FireKeyboardActivity();
+                        FireAnyActivity();
+                        if (!Paused)
+                        {
+                            store.AddKeyboard(KeyNames.FromRaw(keyboard.VKey, keyboard.MakeCode, keyboard.Flags));
+                            FireKeyboardActivity();
+                        }
                     }
                 }
                 else if (header.dwType == RIM_TYPEMOUSE)
                 {
                     RAWMOUSE mouse = (RAWMOUSE)Marshal.PtrToStructure(payload, typeof(RAWMOUSE));
-                    if (!Paused) ProcessMouse(mouse);
+                    ProcessMouse(mouse);
                 }
             }
             finally
@@ -401,6 +457,14 @@ namespace LuluDesktopPet
         private void ProcessMouse(RAWMOUSE mouse)
         {
             ushort f = mouse.usButtonFlags;
+            bool clicked = (f & (0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x0100)) != 0;
+            bool moved = mouse.lLastX != 0 || mouse.lLastY != 0;
+
+            if (clicked || moved || f != 0) FireAnyActivity();
+            if (clicked) FireMouseClickActivity();
+
+            if (Paused) return;
+
             if ((f & 0x0001) != 0) store.AddMouse("左键");
             if ((f & 0x0004) != 0) store.AddMouse("右键");
             if ((f & 0x0010) != 0) store.AddMouse("中键");
@@ -421,6 +485,18 @@ namespace LuluDesktopPet
         private void FireKeyboardActivity()
         {
             Action handler = KeyboardActivity;
+            if (handler != null) handler();
+        }
+
+        private void FireMouseClickActivity()
+        {
+            Action handler = MouseClickActivity;
+            if (handler != null) handler();
+        }
+
+        private void FireAnyActivity()
+        {
+            Action handler = AnyActivity;
             if (handler != null) handler();
         }
 
@@ -543,16 +619,50 @@ namespace LuluDesktopPet
     public sealed class PetWindow : Window
     {
         private readonly StatsStore store = new StatsStore();
+        private readonly SettingsStore settingsStore = new SettingsStore();
         private readonly TextBlock badge;
         private readonly Image petImage;
+        private readonly Canvas eyeOverlay;
+        private readonly Ellipse leftPupil;
+        private readonly Ellipse rightPupil;
         private readonly DispatcherTimer saveTimer;
         private readonly DispatcherTimer typingTimer;
-        private readonly BitmapImage typingFrameA;
-        private readonly BitmapImage typingFrameB;
+        private readonly DispatcherTimer mouseClickTimer;
+        private readonly DispatcherTimer eyeTimer;
+        private readonly DispatcherTimer idleTimer;
+        private readonly DispatcherTimer knockTimer;
+        private readonly BitmapImage workFrame;
+        private readonly BitmapImage typingFrame;
+        private readonly BitmapImage mouseClickFrame;
+        private readonly BitmapImage knockFrame;
+        private readonly BitmapImage knockPressFrame;
+        private MenuItem idleSettingsMenu;
         private GlobalInputTracker tracker;
         private StatsWindow statsWindow;
         private bool allowClose;
         private bool alternateTypingFrame;
+        private bool alternateKnockFrame;
+        private bool isKnocking;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativePoint
+        {
+            public int X;
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LastInputInfo
+        {
+            public uint Size;
+            public uint Time;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out NativePoint point);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetLastInputInfo(ref LastInputInfo info);
 
         public PetWindow()
         {
@@ -568,19 +678,55 @@ namespace LuluDesktopPet
             Left = SystemParameters.WorkArea.Right - Width - 20;
             Top = SystemParameters.WorkArea.Bottom - Height - 20;
 
+            workFrame = LoadImage("lulu-work.png");
+            typingFrame = LoadImage("lulu-work-typing.png");
+            mouseClickFrame = LoadImage("lulu-mouse-click.png");
+            knockFrame = LoadImage("lulu-knock.png");
+            knockPressFrame = LoadImage("lulu-knock-press.png");
+
             Grid root = new Grid();
             Content = root;
 
-            petImage = new Image
+            Viewbox petView = new Viewbox
             {
                 Stretch = Stretch.Uniform,
                 Margin = new Thickness(4, 24, 4, 2),
                 Cursor = Cursors.Hand
             };
-            typingFrameA = LoadImage("lulu-typing.png");
-            typingFrameB = LoadImage("lulu-typing-press.png");
-            petImage.Source = typingFrameA;
-            root.Children.Add(petImage);
+            Grid sprite = new Grid { Width = 1254, Height = 1254 };
+
+            petImage = new Image
+            {
+                Width = 1254,
+                Height = 1254,
+                Stretch = Stretch.Fill,
+                Source = workFrame
+            };
+            sprite.Children.Add(petImage);
+
+            eyeOverlay = new Canvas
+            {
+                Width = 1254,
+                Height = 1254,
+                IsHitTestVisible = false
+            };
+            leftPupil = new Ellipse
+            {
+                Width = 36,
+                Height = 20,
+                Fill = new SolidColorBrush(Color.FromRgb(24, 20, 18))
+            };
+            rightPupil = new Ellipse
+            {
+                Width = 28,
+                Height = 16,
+                Fill = new SolidColorBrush(Color.FromRgb(24, 20, 18))
+            };
+            eyeOverlay.Children.Add(leftPupil);
+            eyeOverlay.Children.Add(rightPupil);
+            sprite.Children.Add(eyeOverlay);
+            petView.Child = sprite;
+            root.Children.Add(petView);
 
             Border badgeBox = new Border
             {
@@ -611,6 +757,7 @@ namespace LuluDesktopPet
             MenuItem sizeSmall = new MenuItem { Header = "迷你（135 px）", IsCheckable = true };
             MenuItem sizeMedium = new MenuItem { Header = "小（170 px）", IsCheckable = true, IsChecked = true };
             MenuItem sizeLarge = new MenuItem { Header = "中（220 px）", IsCheckable = true };
+            idleSettingsMenu = new MenuItem();
             MenuItem exit = new MenuItem { Header = "退出噜噜" };
             stats.Click += delegate { ShowStats(); };
             pause.Click += delegate { if (tracker != null) tracker.Paused = pause.IsChecked; UpdateBadge(); };
@@ -618,6 +765,7 @@ namespace LuluDesktopPet
             sizeSmall.Click += delegate { SetPetSize(135, 152, sizeSmall, sizeMedium, sizeLarge); };
             sizeMedium.Click += delegate { SetPetSize(170, 190, sizeMedium, sizeSmall, sizeLarge); };
             sizeLarge.Click += delegate { SetPetSize(220, 240, sizeLarge, sizeSmall, sizeMedium); };
+            idleSettingsMenu.Click += delegate { ShowIdleSettings(); };
             exit.Click += delegate { allowClose = true; Close(); };
             size.Items.Add(sizeSmall);
             size.Items.Add(sizeMedium);
@@ -626,11 +774,13 @@ namespace LuluDesktopPet
             menu.Items.Add(pause);
             menu.Items.Add(top);
             menu.Items.Add(size);
+            menu.Items.Add(idleSettingsMenu);
             menu.Items.Add(new Separator());
             menu.Items.Add(exit);
             ContextMenu = menu;
+            UpdateIdleMenuText();
 
-            petImage.MouseLeftButtonDown += OnDrag;
+            petView.MouseLeftButtonDown += OnDrag;
             MouseRightButtonUp += delegate { ContextMenu.IsOpen = true; };
 
             SourceInitialized += OnSourceInitialized;
@@ -642,11 +792,24 @@ namespace LuluDesktopPet
             saveTimer.Start();
 
             typingTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(260) };
-            typingTimer.Tick += delegate
+            typingTimer.Tick += delegate { ShowWorkFrame(); };
+
+            mouseClickTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(220) };
+            mouseClickTimer.Tick += delegate { ShowWorkFrame(); };
+
+            eyeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(33) };
+            eyeTimer.Tick += delegate { UpdateEyeDirection(); };
+            eyeTimer.Start();
+
+            idleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            idleTimer.Tick += delegate { CheckIdleTime(); };
+            idleTimer.Start();
+
+            knockTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(420) };
+            knockTimer.Tick += delegate
             {
-                petImage.Source = typingFrameA;
-                alternateTypingFrame = false;
-                typingTimer.Stop();
+                alternateKnockFrame = !alternateKnockFrame;
+                petImage.Source = alternateKnockFrame ? knockPressFrame : knockFrame;
             };
 
             DispatcherTimer dateTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
@@ -661,6 +824,8 @@ namespace LuluDesktopPet
             {
                 tracker = new GlobalInputTracker(this, store);
                 tracker.KeyboardActivity += OnKeyboardActivity;
+                tracker.MouseClickActivity += OnMouseClickActivity;
+                tracker.AnyActivity += OnAnyActivity;
             }
             catch (Exception ex)
             {
@@ -670,13 +835,173 @@ namespace LuluDesktopPet
 
         private void OnKeyboardActivity()
         {
-            if (typingFrameB != null)
+            if (isKnocking) StopKnocking();
+            mouseClickTimer.Stop();
+            if (typingFrame != null)
             {
                 alternateTypingFrame = !alternateTypingFrame;
-                petImage.Source = alternateTypingFrame ? typingFrameB : typingFrameA;
+                petImage.Source = alternateTypingFrame ? typingFrame : workFrame;
             }
             typingTimer.Stop();
             typingTimer.Start();
+        }
+
+        private void OnMouseClickActivity()
+        {
+            if (isKnocking) StopKnocking();
+            typingTimer.Stop();
+            alternateTypingFrame = false;
+            if (mouseClickFrame != null) petImage.Source = mouseClickFrame;
+            mouseClickTimer.Stop();
+            mouseClickTimer.Start();
+        }
+
+        private void OnAnyActivity()
+        {
+            if (isKnocking) StopKnocking();
+        }
+
+        private void ShowWorkFrame()
+        {
+            typingTimer.Stop();
+            mouseClickTimer.Stop();
+            alternateTypingFrame = false;
+            if (!isKnocking) petImage.Source = workFrame;
+        }
+
+        private void CheckIdleTime()
+        {
+            double minutes = settingsStore.Settings.IdleMinutes;
+            if (minutes <= 0 || isKnocking) return;
+            LastInputInfo info = new LastInputInfo();
+            info.Size = (uint)Marshal.SizeOf(typeof(LastInputInfo));
+            if (!GetLastInputInfo(ref info)) return;
+            uint now = unchecked((uint)Environment.TickCount);
+            uint idleMilliseconds = unchecked(now - info.Time);
+            if (idleMilliseconds >= minutes * 60000.0) StartKnocking();
+        }
+
+        private void StartKnocking()
+        {
+            if (knockFrame == null) return;
+            isKnocking = true;
+            typingTimer.Stop();
+            mouseClickTimer.Stop();
+            alternateKnockFrame = false;
+            eyeOverlay.Visibility = Visibility.Hidden;
+            petImage.Source = knockFrame;
+            knockTimer.Start();
+            UpdateBadge();
+        }
+
+        private void StopKnocking()
+        {
+            if (!isKnocking) return;
+            isKnocking = false;
+            knockTimer.Stop();
+            alternateKnockFrame = false;
+            eyeOverlay.Visibility = Visibility.Visible;
+            ShowWorkFrame();
+            UpdateBadge();
+        }
+
+        private void UpdateEyeDirection()
+        {
+            if (isKnocking || !IsLoaded) return;
+            NativePoint cursor;
+            if (!GetCursorPos(out cursor)) return;
+
+            try
+            {
+                Point center = PointToScreen(new Point(ActualWidth / 2.0, ActualHeight / 2.0));
+                double nx = Math.Max(-1.0, Math.Min(1.0, (cursor.X - center.X) / 280.0));
+                double ny = Math.Max(-1.0, Math.Min(1.0, (cursor.Y - center.Y) / 220.0));
+
+                Canvas.SetLeft(leftPupil, 433 + nx * 18);
+                Canvas.SetTop(leftPupil, 358 + ny * 6);
+                Canvas.SetLeft(rightPupil, 730 + nx * 12);
+                Canvas.SetTop(rightPupil, 309 + ny * 4);
+            }
+            catch
+            {
+            }
+        }
+
+        private void ShowIdleSettings()
+        {
+            Window dialog = new Window
+            {
+                Title = "噜噜敲屏时间",
+                Width = 340,
+                Height = 190,
+                Owner = this,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                ResizeMode = ResizeMode.NoResize,
+                Background = new SolidColorBrush(Color.FromRgb(255, 249, 232)),
+                FontFamily = new FontFamily("Microsoft YaHei UI"),
+                Topmost = Topmost
+            };
+
+            StackPanel panel = new StackPanel { Margin = new Thickness(20) };
+            panel.Children.Add(new TextBlock
+            {
+                Text = "多久没有键盘或鼠标操作后，让噜噜敲屏？",
+                FontSize = 14,
+                Margin = new Thickness(0, 0, 0, 10)
+            });
+            TextBox input = new TextBox
+            {
+                Text = settingsStore.Settings.IdleMinutes.ToString("0.##", CultureInfo.CurrentCulture),
+                FontSize = 16,
+                Padding = new Thickness(6),
+                ToolTip = "单位：分钟"
+            };
+            panel.Children.Add(input);
+            panel.Children.Add(new TextBlock
+            {
+                Text = "单位：分钟。支持小数；输入 0 可关闭敲屏提醒。",
+                Foreground = Brushes.Gray,
+                Margin = new Thickness(0, 6, 0, 12)
+            });
+
+            StackPanel buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right
+            };
+            Button cancel = new Button { Content = "取消", Width = 70, Margin = new Thickness(0, 0, 8, 0), IsCancel = true };
+            Button ok = new Button { Content = "保存", Width = 70, IsDefault = true };
+            cancel.Click += delegate { dialog.DialogResult = false; };
+            ok.Click += delegate
+            {
+                double value;
+                bool parsed = double.TryParse(input.Text, NumberStyles.Float, CultureInfo.CurrentCulture, out value) ||
+                    double.TryParse(input.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+                if (!parsed || value < 0 || value > 1440)
+                {
+                    MessageBox.Show("请输入 0 到 1440 之间的分钟数。", "时间格式不正确",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+                settingsStore.Settings.IdleMinutes = value;
+                settingsStore.Save();
+                StopKnocking();
+                UpdateIdleMenuText();
+                dialog.DialogResult = true;
+            };
+            buttons.Children.Add(cancel);
+            buttons.Children.Add(ok);
+            panel.Children.Add(buttons);
+            dialog.Content = panel;
+            dialog.ShowDialog();
+        }
+
+        private void UpdateIdleMenuText()
+        {
+            double minutes = settingsStore.Settings.IdleMinutes;
+            idleSettingsMenu.Header = minutes <= 0
+                ? "无操作敲屏：已关闭…"
+                : "无操作敲屏：" + minutes.ToString("0.##") + " 分钟…";
         }
 
         private BitmapImage LoadImage(string fileName)
@@ -727,6 +1052,7 @@ namespace LuluDesktopPet
         private void UpdateBadge()
         {
             string prefix = tracker != null && tracker.Paused ? "已暂停\n" : "";
+            if (isKnocking) prefix = "敲敲！\n";
             badge.Text = prefix +
                 "⌨ " + store.TodayKeyboardTotal().ToString("N0") +
                 "\n🖱 " + store.TodayMouseClickTotal().ToString("N0");

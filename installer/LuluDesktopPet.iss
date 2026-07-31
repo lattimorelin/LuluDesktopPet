@@ -1,5 +1,5 @@
 #define MyAppName "噜噜桌宠"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.1"
 #define MyAppPublisher "噜噜桌宠"
 #define MyAppExeName "LuluDesktopPet.exe"
 

@@ -4,3 +4,4 @@ tools/
 innosetup-*.exe
 innosetup-install.log
 *.tmp
+._cache_*.exe
