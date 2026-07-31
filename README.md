@@ -1,7 +1,7 @@
 # ⌨️ 噜噜桌宠 🐾
 
 <p align="center">
-  <img src="assets/lulu-typing.png" width="220" alt="正在认真敲键盘的噜噜">
+  <img src="assets/lulu-readme.png" width="220" alt="带着鼠标认真工作的噜噜">
 </p>
 
 <p align="center">
